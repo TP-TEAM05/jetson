@@ -1,0 +1,19 @@
+def preprocess(self, roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    # Adaptívny threshold - nevyžaduje pevný kontrast
+    # Každá oblasť obrazu sa prahuje samostatne
+    binary = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,   # veľkosť okna - zväčši ak šum, zmenši ak nereaguje
+        10    # citlivosť - zmenši pre väčšiu citlivosť
+    )
+    
+    kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    return binary
