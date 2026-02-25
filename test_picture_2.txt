@@ -1,0 +1,30 @@
+python3 -c "
+import cv2
+import numpy as np
+
+# Test 1 - cierna paska na siedom pozadi, ciara v strede
+img1 = np.ones((480,640,3), dtype=np.uint8)*180  # sive pozadie
+cv2.rectangle(img1,(300,0),(340,480),(20,20,20),-1)  # cierna paska
+cv2.imwrite('test_siva_stred.jpg', img1)
+
+# Test 2 - ciara vlavo
+img2 = np.ones((480,640,3), dtype=np.uint8)*180
+cv2.rectangle(img2,(80,0),(120,480),(20,20,20),-1)
+cv2.imwrite('test_siva_vlavo.jpg', img2)
+
+# Test 3 - ciara vpravo
+img3 = np.ones((480,640,3), dtype=np.uint8)*180
+cv2.rectangle(img3,(520,0),(560,480),(20,20,20),-1)
+cv2.imwrite('test_siva_vpravo.jpg', img3)
+
+# Test 4 - zakruta vpravo
+img4 = np.ones((480,640,3), dtype=np.uint8)*180
+cv2.line(img4,(320,480),(580,0),(20,20,20),35)
+cv2.imwrite('test_siva_zakruta.jpg', img4)
+
+# Test 5 - slaby kontrast (tazsi pripad)
+img5 = np.ones((480,640,3), dtype=np.uint8)*160  # tmavosive pozadie
+cv2.rectangle(img5,(300,0),(340,480),(60,60,60),-1)  # tmavsia paska
+cv2.imwrite('test_slaby_kontrast.jpg', img5)
+
+print('Vsetky obrazky vytvorene')
