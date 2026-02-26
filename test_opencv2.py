@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import time
+import argparse
+
+
+class Config:
+    CAMERA_ID = 0
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
+    FPS = 30
+    ROI_START = 0.55
+    ROI_END = 0.95
+    MIN_CONTOUR_AREA = 500
+    KP = 0.40
+    KI = 0.001
+    KD = 0.08
+    BASE_SPEED = 0.30
+    MAX_SPEED = 0.50
+    MIN_SPEED = 0.10
+    MAX_STEER_DEG = 40
+
+
+class PID:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.prev_time = time.time()
+
+    def reset(self):
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.prev_time = time.time()
+
+    def update(self, error):
+        now = time.time()
+        dt = max(now - self.prev_time, 0.001)
+        self.integral = max(-1.0, min(1.0, self.integral + error * dt))
+        derivative = (error - self.prev_error) / dt
+        output = (self.kp * error +
+                  self.ki * self.integral +
+                  self.kd * derivative)
+        self.prev_error = error
+        self.prev_time = now
+        return output
+
+
+class MotorController:
+    def __init__(self, use_serial=False, serial_port="/dev/ttyUSB0"):
+        self.use_serial = use_serial
+        self.ser = None
+        if use_serial:
+            import serial
+            try:
+                self.ser = serial.Serial(serial_port, 115200, timeout=1)
+                print(f"Serial pripojený: {serial_port}")
+            except Exception as e:
+                print(f"Serial nedostupný: {e}")
+                self.use_serial = False
+
+    def send(self, speed, steering_normalized):
+        angle_deg = 90 + int(steering_normalized * Config.MAX_STEER_DEG)
+        angle_deg = max(90 - Config.MAX_STEER_DEG,
+                        min(90 + Config.MAX_STEER_DEG, angle_deg))
+        message = f"<{speed:.2f},{angle_deg}>"
+        if self.use_serial and self.ser:
+            try:
+                self.ser.write(message.encode())
+            except Exception as e:
+                print(f"Serial chyba: {e}")
+        return message
+
+    def stop(self):
+        self.send(0.0, 0.0)
+
+    def cleanup(self):
+        self.stop()
+        if self.ser:
+            self.ser.close()
+
+
+class LineDetector:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def get_roi(self, frame):
+        h = frame.shape[0]
+        y_start = int(h * self.cfg.ROI_START)
+        y_end = int(h * self.cfg.ROI_END)
+        return frame[y_start:y_end, :], y_start
+
+    def preprocess(self, roi):
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        binary = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            10
+        )
+        kernel = np.ones((5, 5), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        return binary
+
+    def find_center(self, binary):
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < self.cfg.MIN_CONTOUR_AREA:
+            return None
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return None
+        return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+
+    def detect(self, frame):
+        roi, y_offset = self.get_roi(frame)
+        binary = self.preprocess(roi)
+        result = self.find_center(binary)
+        frame_center = binary.shape[1] // 2
+        debug = frame.copy()
+        if result is None:
+            return None, debug
+        cx, cy = result
+        error = (cx - frame_center) / frame_center
+        cv2.circle(debug, (cx, cy + y_offset), 8, (0, 0, 255), -1)
+        cv2.line(debug,
+                 (frame_center, y_offset),
+                 (frame_center, frame.shape[0]),
+                 (255, 0, 0), 1)
+        cv2.line(debug,
+                 (cx, y_offset),
+                 (cx, frame.shape[0]),
+                 (0, 255, 0), 2)
+        cv2.rectangle(debug,
+                      (0, y_offset),
+                      (frame.shape[1],
+                       int(frame.shape[0] * self.cfg.ROI_END)),
+                      (255, 255, 0), 2)
+        return error, debug
+
+
+class LineFollower:
+    def __init__(self, show_preview=True, use_serial=False,
+                 serial_port="/dev/ttyUSB0"):
+        self.cfg = Config()
+        self.show_preview = show_preview
+        self.pid = PID(self.cfg.KP, self.cfg.KI, self.cfg.KD)
+        self.detector = LineDetector(self.cfg)
+        self.motor = MotorController(use_serial, serial_port)
+        self.frame_count = 0
+        self.lost_count = 0
+        self.start_time = time.time()
+        self.last_error = 0.0
+        self.last_seen = time.time()
+        self.cap = None
+
+    def open_camera(self):
+        self.cap = cv2.VideoCapture(self.cfg.CAMERA_ID)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.FRAME_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, self.cfg.FPS)
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                "Kamera sa nedá otvoriť! Skontroluj: ls /dev/video*")
+        print(f"Kamera OK: {self.cfg.FRAME_WIDTH}x"
+              f"{self.cfg.FRAME_HEIGHT}@{self.cfg.FPS}fps")
+
+    def compute_speed(self, error):
+        speed = self.cfg.BASE_SPEED * (1.0 - 0.5 * abs(error))
+        return max(self.cfg.MIN_SPEED, min(self.cfg.MAX_SPEED, speed))
+
+    def run(self):
+        self.open_camera()
+        consecutive_lost = 0
+        MAX_LOST = 15
+        print("Spustené. Q = ukončiť.")
+
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Kamera nedostupná!")
+                    break
+
+                self.frame_count += 1
+                error, debug = self.detector.detect(frame)
+
+                if error is not None:
+                    consecutive_lost = 0
+                    self.last_error = error
+                    self.last_seen = time.time()
+                    steering = max(-1.0, min(1.0,
+                                            self.pid.update(error)))
+                    speed = self.compute_speed(error)
+                    msg = self.motor.send(speed, steering)
+                    fps = (self.frame_count /
+                           (time.time() - self.start_time))
+                    print(f"\r[{self.frame_count:5d}] "
+                          f"err={error:+.3f} "
+                          f"steer={steering:+.3f} "
+                          f"speed={speed:.2f} "
+                          f"cmd={msg} "
+                          f"fps={fps:.1f}",
+                          end="", flush=True)
+                else:
+                    consecutive_lost += 1
+                    self.lost_count += 1
+                    time_lost = time.time() - self.last_seen
+
+                    if time_lost < 0.5:
+                        steering = self.last_error * 0.5
+                        speed = 0.1
+                    elif time_lost < 2.0:
+                        steering = (1.0 if self.last_error > 0
+                                    else -1.0)
+                        speed = 0.05
+                    else:
+                        steering = 0.0
+                        speed = 0.0
+                        self.motor.stop()
+                        self.pid.reset()
+
+                    self.motor.send(speed, steering)
+
+                if self.show_preview:
+                    cv2.imshow("Line Follower", debug)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+        except KeyboardInterrupt:
+            print("\nUkončujem...")
+        finally:
+            self.motor.stop()
+            self.motor.cleanup()
+            self.cap.release()
+            cv2.destroyAllWindows()
+            elapsed = time.time() - self.start_time
+            print(f"\nHotovo: {self.frame_count} snímok "
+                  f"za {elapsed:.1f}s | "
+                  f"stratená čiara: {self.lost_count}x")
+
+
+def test_on_image(image_path):
+    cfg = Config()
+    detector = LineDetector(cfg)
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Obrázok {image_path} sa nedá načítať")
+        return
+    error, debug = detector.detect(img)
+    if error is not None:
+        print(f"Čiara nájdená! Error: {error:+.3f}")
+        print(f"Riadenie: {90 + int(error * cfg.MAX_STEER_DEG)}°")
+    else:
+        print("Čiara NENÁJDENÁ")
+    cv2.imshow("Test", debug)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def calibrate():
+    cfg = Config()
+    cap = cv2.VideoCapture(cfg.CAMERA_ID)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.FRAME_HEIGHT)
+    cv2.namedWindow("Kalibracia")
+    cv2.createTrackbar("Block size", "Kalibracia", 31, 101,
+                       lambda x: None)
+    cv2.createTrackbar("Konstanta", "Kalibracia", 10, 50,
+                       lambda x: None)
+    cv2.createTrackbar("ROI %", "Kalibracia",
+                       int(cfg.ROI_START * 100), 100,
+                       lambda x: None)
+    print("Nastav parametre. S = ulož, Q = koniec.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        block = cv2.getTrackbarPos("Block size", "Kalibracia")
+        konst = cv2.getTrackbarPos("Konstanta", "Kalibracia")
+        roi_pct = cv2.getTrackbarPos("ROI %", "Kalibracia")
+
+        if block % 2 == 0:
+            block += 1
+        if block < 3:
+            block = 3
+
+        h = frame.shape[0]
+        roi = frame[int(h * roi_pct / 100):int(h * 0.95), :]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        binary = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block, konst
+        )
+
+        cv2.imshow("Kalibracia", binary)
+        cv2.imshow("Original", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('s'):
+            print(f"\nUlož do preprocess():")
+            print(f"  block size = {block}")
+            print(f"  konstanta  = {konst}")
+            print(f"  ROI_START  = {roi_pct/100:.2f}")
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode",
+                        choices=["run", "calibrate", "test"],
+                        default="run")
+    parser.add_argument("--image", type=str)
+    parser.add_argument("--serial", action="store_true")
+    parser.add_argument("--port", type=str, default="/dev/ttyUSB0")
+    parser.add_argument("--no-preview", action="store_true")
+    args = parser.parse_args()
+
+    if args.mode == "calibrate":
+        calibrate()
+    elif args.mode == "test":
+        if not args.image:
+            print("Zadaj: --image cesta/k/obrazku.jpg")
+        else:
+            test_on_image(args.image)
+    else:
+        LineFollower(
+            show_preview=not args.no_preview,
+            use_serial=args.serial,
+            serial_port=args.port
+        ).run()
