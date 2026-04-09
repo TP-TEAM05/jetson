@@ -15,3 +15,7 @@ ros2 launch f1tenth_stack bringup_launch.py
 
 
 Good luck!
+
+# Bonus if you want lidar in rviz2
+ros2 run urg_node urg_node_driver --ros-args -p sensor_interface:=ethernet -p ip_address:="192.168.0.10"
+rviz2
