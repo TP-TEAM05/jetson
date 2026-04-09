@@ -20,3 +20,11 @@ Good luck!
 ros2 run urg_node urg_node_driver --ros-args -p sensor_interface:=ethernet -p ip_address:="192.168.0.10"
 
 rviz2
+
+# Fix for no signal
+
+sudo ip addr flush dev enP8p1s0
+
+sudo ip addr add 192.168.0.15/24 dev enP8p1s0
+
+sudo ip link set enP8p1s0 up
