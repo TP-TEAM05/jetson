@@ -1,0 +1,37 @@
+# One-time car setup
+# Install
+sudo apt install tigervnc-standalone-server xfce4 xfce4-goodies
+
+# Fix runtime dir permissions
+chmod 700 /tmp/runtime-anjielik2
+
+# Create xstartup
+mkdir -p ~/.vnc
+cat > ~/.vnc/xstartup << 'EOF'
+#!/bin/bash
+export XDG_RUNTIME_DIR=/tmp/runtime-$USER
+mkdir -p $XDG_RUNTIME_DIR
+dbus-launch --exit-with-session startxfce4
+EOF
+chmod +x ~/.vnc/xstartup
+
+# Set VNC password
+vncserver :1  # just to trigger password setup, then kill it
+vncserver -kill :1
+
+
+# Car — every session (manual start)
+chmod 700 /tmp/runtime-anjielik2
+vncserver -kill :1 2>/dev/null
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+vncserver :1 -geometry 1920x1080 -depth 24
+
+
+# Laptop one-time setup
+sudo apt install tigervnc-viewer
+
+# Laptop - every-session (connect)
+kill $(pgrep -f "ssh -L 5901") 2>/dev/null
+ssh -L 5901:localhost:5901 anjielik2@192.168.21.122 -N -f
+sleep 1
+vncviewer localhost:5901
