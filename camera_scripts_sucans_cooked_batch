@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+import time
+import math
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, Float32
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class PID:
+    def __init__(self, kp, ki, kd, integral_limit=1.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral_limit = integral_limit
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.prev_time = None
+
+    def reset(self):
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.prev_time = None
+
+    def update(self, error):
+        now = time.monotonic()
+
+        if self.prev_time is None:
+            self.prev_time = now
+            self.prev_error = error
+            return self.kp * error
+
+        dt = max(now - self.prev_time, 1e-3)
+        self.integral = clamp(self.integral + error * dt, -self.integral_limit, self.integral_limit)
+        derivative = (error - self.prev_error) / dt
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        self.prev_error = error
+        self.prev_time = now
+        return output
+
+
+class LaneAnglePublisher(Node):
+    def __init__(self):
+        super().__init__("lane_angle_publisher")
+
+        # Camera
+        self.declare_parameter("use_usb_camera", False)
+        self.declare_parameter("usb_index", 0)
+        self.declare_parameter("frame_width", 1280)
+        self.declare_parameter("frame_height", 720)
+        self.declare_parameter("fps", 60)
+
+        # 180° rotation by default
+        self.declare_parameter("flip_method", 2)
+
+        # Processing
+        self.declare_parameter("process_width", 640)
+        self.declare_parameter("process_height", 360)
+        self.declare_parameter("roi_start", 0.55)
+        self.declare_parameter("roi_end", 0.95)
+
+        # true = biela čiara na tmavšom podklade
+        self.declare_parameter("line_is_white", True)
+
+        self.declare_parameter("min_contour_area", 500)
+        self.declare_parameter("max_contour_area", 120000)
+
+        self.declare_parameter("show_preview", True)
+
+        # tracking
+        self.declare_parameter("max_center_jump_px", 100)
+        self.declare_parameter("min_center_points", 8)
+        self.declare_parameter("contour_center_preference_gain", 1.8)
+        self.declare_parameter("contour_bottom_gain", 2.0)
+        self.declare_parameter("contour_area_gain", 0.002)
+
+        # Control
+        self.declare_parameter("kp", 0.90)
+        self.declare_parameter("ki", 0.0005)
+        self.declare_parameter("kd", 0.08)
+        self.declare_parameter("integral_limit", 1.0)
+
+        self.declare_parameter("heading_gain", 0.65)
+        self.declare_parameter("max_steering_deg", 28.0)
+        self.declare_parameter("max_steering_step", 0.08)
+
+        self.declare_parameter("lost_frame_brake_after", 3)
+
+        self.declare_parameter("base_speed_erpm", 1500.0)
+        self.declare_parameter("min_speed_erpm", 800.0)
+        self.declare_parameter("max_speed_erpm", 2500.0)
+        self.declare_parameter("corner_slowdown", 0.40)
+
+        # Params load
+        self.use_usb_camera = bool(self.get_parameter("use_usb_camera").value)
+        self.usb_index = int(self.get_parameter("usb_index").value)
+        self.frame_width = int(self.get_parameter("frame_width").value)
+        self.frame_height = int(self.get_parameter("frame_height").value)
+        self.fps = int(self.get_parameter("fps").value)
+        self.flip_method = int(self.get_parameter("flip_method").value)
+
+        self.process_width = int(self.get_parameter("process_width").value)
+        self.process_height = int(self.get_parameter("process_height").value)
+        self.roi_start = float(self.get_parameter("roi_start").value)
+        self.roi_end = float(self.get_parameter("roi_end").value)
+        self.line_is_white = bool(self.get_parameter("line_is_white").value)
+
+        self.min_contour_area = int(self.get_parameter("min_contour_area").value)
+        self.max_contour_area = int(self.get_parameter("max_contour_area").value)
+        self.show_preview = bool(self.get_parameter("show_preview").value)
+
+        self.max_center_jump_px = int(self.get_parameter("max_center_jump_px").value)
+        self.min_center_points = int(self.get_parameter("min_center_points").value)
+        self.contour_center_preference_gain = float(self.get_parameter("contour_center_preference_gain").value)
+        self.contour_bottom_gain = float(self.get_parameter("contour_bottom_gain").value)
+        self.contour_area_gain = float(self.get_parameter("contour_area_gain").value)
+
+        kp = float(self.get_parameter("kp").value)
+        ki = float(self.get_parameter("ki").value)
+        kd = float(self.get_parameter("kd").value)
+        integral_limit = float(self.get_parameter("integral_limit").value)
+
+        self.heading_gain = float(self.get_parameter("heading_gain").value)
+        self.max_steering_deg = float(self.get_parameter("max_steering_deg").value)
+        self.max_steering_step = float(self.get_parameter("max_steering_step").value)
+        self.lost_frame_brake_after = int(self.get_parameter("lost_frame_brake_after").value)
+
+        self.base_speed_erpm = float(self.get_parameter("base_speed_erpm").value)
+        self.min_speed_erpm = float(self.get_parameter("min_speed_erpm").value)
+        self.max_speed_erpm = float(self.get_parameter("max_speed_erpm").value)
+        self.corner_slowdown = float(self.get_parameter("corner_slowdown").value)
+
+        self.pid = PID(kp, ki, kd, integral_limit)
+        self.last_steering_norm = 0.0
+        self.last_center_x = None
+        self.miss_count = 0
+        self.last_log_time = time.monotonic()
+
+        # Publish only necessary topics
+        self.pub_angle_deg = self.create_publisher(Float32, "/perception/steering_angle_deg", 10)
+        self.pub_found = self.create_publisher(Bool, "/perception/line_found", 10)
+        self.pub_speed = self.create_publisher(Float32, "/perception/speed_erpm_suggestion", 10)
+
+        # Optional CUDA
+        self.cuda_enabled = False
+        self.gpu_frame = None
+        self.gaussian_filter = None
+        try:
+            if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                self.cuda_enabled = True
+                self.gpu_frame = cv2.cuda_GpuMat()
+                self.gaussian_filter = cv2.cuda.createGaussianFilter(
+                    cv2.CV_8UC1, cv2.CV_8UC1, (7, 7), 0
+                )
+        except Exception:
+            self.cuda_enabled = False
+
+        self.cap = self.open_camera()
+        if self.cap is None or not self.cap.isOpened():
+            raise RuntimeError("Failed to open camera")
+
+        self.get_logger().info(
+            f"Camera opened: {self.frame_width}x{self.frame_height}@{self.fps}, "
+            f"flip_method={self.flip_method}, cuda_enabled={self.cuda_enabled}"
+        )
+
+        self.timer = self.create_timer(1.0 / max(self.fps, 1), self.process_frame)
+
+    def open_camera(self):
+        if self.use_usb_camera:
+            cap = cv2.VideoCapture(self.usb_index)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+            cap.set(cv2.CAP_PROP_FPS, self.fps)
+            return cap
+
+        pipeline = (
+            f"nvarguscamerasrc ! "
+            f"video/x-raw(memory:NVMM), width={self.frame_width}, height={self.frame_height}, "
+            f"format=NV12, framerate={self.fps}/1 ! "
+            f"nvvidconv flip-method={self.flip_method} ! "
+            f"video/x-raw, format=BGRx ! "
+            f"videoconvert ! video/x-raw, format=BGR ! "
+            f"appsink drop=1 max-buffers=1 sync=false"
+        )
+        return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+    def compute_speed_suggestion(self, steering_norm):
+        erpm = self.base_speed_erpm * (1.0 - self.corner_slowdown * abs(steering_norm))
+        return clamp(erpm, self.min_speed_erpm, self.max_speed_erpm)
+
+    def rate_limit_steering(self, target):
+        delta = target - self.last_steering_norm
+        if delta > self.max_steering_step:
+            target = self.last_steering_norm + self.max_steering_step
+        elif delta < -self.max_steering_step:
+            target = self.last_steering_norm - self.max_steering_step
+
+        self.last_steering_norm = clamp(target, -1.0, 1.0)
+        return self.last_steering_norm
+
+    def preprocess_binary(self, roi):
+        if self.cuda_enabled:
+            self.gpu_frame.upload(roi)
+            gpu_gray = cv2.cuda.cvtColor(self.gpu_frame, cv2.COLOR_BGR2GRAY)
+            gpu_blurred = self.gaussian_filter.apply(gpu_gray)
+            gray_blur = gpu_blurred.download()
+        else:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray_blur = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        thresh_type = cv2.THRESH_BINARY if self.line_is_white else cv2.THRESH_BINARY_INV
+        _, binary = cv2.threshold(gray_blur, 0, 255, thresh_type | cv2.THRESH_OTSU)
+
+        kernel = np.ones((5, 5), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        return binary
+
+    def choose_best_contour(self, contours, roi_width):
+        valid = [c for c in contours if self.min_contour_area < cv2.contourArea(c) < self.max_contour_area]
+        if not valid:
+            return None
+
+        roi_center = roi_width / 2.0
+        best = None
+        best_score = None
+
+        for c in valid:
+            x, y, w, h = cv2.boundingRect(c)
+            cx = x + w / 2.0
+            bottomness = y + h
+            area = cv2.contourArea(c)
+
+            # prefer contour near previous tracked one
+            if self.last_center_x is None:
+                center_penalty = abs(cx - roi_center)
+            else:
+                center_penalty = abs(cx - self.last_center_x)
+
+            score = (
+                self.contour_bottom_gain * bottomness
+                + self.contour_area_gain * area
+                - self.contour_center_preference_gain * center_penalty
+            )
+
+            if best is None or score > best_score:
+                best = c
+                best_score = score
+
+        return best
+
+    def extract_centerline_points_from_single_contour(self, contour_mask):
+        """
+        IMPORTANT:
+        centerline is extracted only from ONE chosen contour mask.
+        This prevents mixing two separate white lines.
+        """
+        h, w = contour_mask.shape[:2]
+        center_points = []
+        last_x = None
+
+        for y in range(h - 1, -1, -4):
+            xs = np.where(contour_mask[y] > 0)[0]
+            if xs.size < 2:
+                continue
+
+            # because mask contains only ONE contour, min/max belong to that same line
+            left_x = int(xs.min())
+            right_x = int(xs.max())
+            center_x = int((left_x + right_x) / 2)
+
+            if last_x is not None and abs(center_x - last_x) > self.max_center_jump_px:
+                continue
+
+            center_points.append((center_x, y, left_x, right_x))
+            last_x = center_x
+
+        return center_points
+
+    def fit_centerline(self, center_points):
+        if len(center_points) < self.min_center_points:
+            return None
+
+        ys = np.array([p[1] for p in center_points], dtype=np.float32)
+        xs = np.array([p[0] for p in center_points], dtype=np.float32)
+
+        try:
+            a, b = np.polyfit(ys, xs, 1)  # x = a*y + b
+            return a, b
+        except Exception:
+            return None
+
+    def detect_line(self, frame):
+        proc = cv2.resize(frame, (self.process_width, self.process_height), interpolation=cv2.INTER_AREA)
+        debug = proc.copy()
+
+        h, w = proc.shape[:2]
+        y1 = int(h * self.roi_start)
+        y2 = int(h * self.roi_end)
+
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(y1 + 1, min(h, y2))
+
+        roi = proc[y1:y2, :]
+        if roi.size == 0:
+            return False, 0.0, debug
+
+        binary = self.preprocess_binary(roi)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        frame_center = w // 2
+        cv2.rectangle(debug, (0, y1), (w - 1, y2 - 1), (255, 255, 0), 2)
+        cv2.line(debug, (frame_center, y1), (frame_center, y2), (255, 0, 0), 2)
+
+        best = self.choose_best_contour(contours, roi.shape[1])
+        if best is None:
+            return False, 0.0, debug
+
+        # build mask ONLY for selected contour
+        single_mask = np.zeros_like(binary)
+        cv2.drawContours(single_mask, [best], -1, 255, thickness=cv2.FILLED)
+
+        best_draw = best.copy()
+        best_draw[:, 0, 1] += y1
+        cv2.drawContours(debug, [best_draw], -1, (0, 255, 0), 2)
+
+        center_points = self.extract_centerline_points_from_single_contour(single_mask)
+        if len(center_points) < self.min_center_points:
+            return False, 0.0, debug
+
+        # draw center samples
+        for cx, cy, lx, rx in center_points:
+            yy = cy + y1
+            cv2.circle(debug, (lx, yy), 1, (0, 255, 255), -1)
+            cv2.circle(debug, (rx, yy), 1, (0, 255, 255), -1)
+            cv2.circle(debug, (cx, yy), 3, (0, 0, 255), -1)
+
+        fit = self.fit_centerline(center_points)
+        if fit is None:
+            return False, 0.0, debug
+
+        a, b = fit
+        roi_h = roi.shape[0]
+
+        y_bottom_roi = roi_h - 1
+        y_top_roi = 0
+
+        x_bottom = int(a * y_bottom_roi + b)
+        x_top = int(a * y_top_roi + b)
+
+        x_bottom = int(clamp(x_bottom, 0, w - 1))
+        x_top = int(clamp(x_top, 0, w - 1))
+
+        # final centerline
+        cv2.line(debug, (x_bottom, y_bottom_roi + y1), (x_top, y_top_roi + y1), (0, 0, 255), 2)
+        cv2.circle(debug, (x_bottom, y_bottom_roi + y1), 8, (0, 0, 255), -1)
+
+        self.last_center_x = x_bottom
+
+        lateral_error = (x_bottom - frame_center) / max(frame_center, 1)
+        lateral_error = clamp(lateral_error, -1.0, 1.0)
+
+        dx = x_top - x_bottom
+        dy = y_top_roi - y_bottom_roi
+        heading_angle = math.atan2(dx, -dy)
+        heading_error = clamp(heading_angle / math.radians(45.0), -1.0, 1.0)
+
+        combined_error = clamp(lateral_error + self.heading_gain * heading_error, -1.0, 1.0)
+
+        cv2.putText(
+            debug,
+            f"lat={lateral_error:+.3f} head={heading_error:+.3f} err={combined_error:+.3f}",
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        return True, combined_error, debug
+
+    def publish_values(self, line_found, angle_deg, speed_erpm):
+        msg_found = Bool()
+        msg_found.data = bool(line_found)
+        self.pub_found.publish(msg_found)
+
+        msg_angle = Float32()
+        msg_angle.data = float(angle_deg)
+        self.pub_angle_deg.publish(msg_angle)
+
+        msg_speed = Float32()
+        msg_speed.data = float(speed_erpm)
+        self.pub_speed.publish(msg_speed)
+
+    def process_frame(self):
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.get_logger().warning("Camera returned no frame")
+            time.sleep(0.01)
+            return
+
+        line_found, error, debug = self.detect_line(frame)
+
+        if line_found:
+            self.miss_count = 0
+            steering_raw = self.pid.update(error)
+            steering_norm = clamp(steering_raw, -1.0, 1.0)
+            steering_norm = self.rate_limit_steering(steering_norm)
+            angle_deg = steering_norm * self.max_steering_deg
+            speed_erpm = self.compute_speed_suggestion(steering_norm)
+        else:
+            self.miss_count += 1
+            if self.miss_count >= self.lost_frame_brake_after:
+                self.pid.reset()
+                self.last_steering_norm = 0.0
+                self.last_center_x = None
+                angle_deg = 0.0
+                speed_erpm = 0.0
+            else:
+                angle_deg = self.last_steering_norm * self.max_steering_deg
+                speed_erpm = self.min_speed_erpm
+
+        self.publish_values(line_found, angle_deg, speed_erpm)
+
+        if self.show_preview:
+            cv2.imshow("Lane Angle Publisher", debug)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.get_logger().info("Quit requested")
+                rclpy.shutdown()
+
+        now = time.monotonic()
+        if now - self.last_log_time >= 1.0:
+            self.get_logger().info(
+                f"line_found={line_found} angle_deg={angle_deg:+.2f} speed_erpm={speed_erpm:.0f}"
+            )
+            self.last_log_time = now
+
+    def destroy_node(self):
+        try:
+            if hasattr(self, "cap") and self.cap is not None:
+                self.cap.release()
+        finally:
+            cv2.destroyAllWindows()
+        return super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = LaneAnglePublisher()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
